@@ -52,8 +52,7 @@ var runCmd = &cobra.Command{
 		// Can only run on host OS
 		targetOS := runtime.GOOS
 
-		// forcefully enable --debug as it is not optional for 'hover run'
-		buildDebug = true
+		initBuildParameters(targetOS, build.DebugMode)
 
 		if runOmitFlutterBundle {
 			log.Infof("Omiting flutter build bundle")
@@ -123,7 +122,7 @@ func runAndAttach(projectName string, targetOS string) {
 	// Non-blockingly echo command stderr to terminal
 	go io.Copy(os.Stderr, stderrApp)
 
-	log.Infof("Running %s in debug mode", projectName)
+	log.Infof("Running %s in %s mode", projectName, buildOrRunMode.Name)
 	err = cmdApp.Start()
 	if err != nil {
 		log.Errorf("Failed to start app '%s': %v", projectName, err)

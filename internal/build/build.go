@@ -71,18 +71,55 @@ func OutputBinaryPath(executableName, targetOS string) string {
 	return outputBinaryPath
 }
 
-// EngineFilename returns the name of the engine file from flutter for the
-// specified platform.
-func EngineFilename(targetOS string) string {
+// ExecutableExtension returns the extension of binary files on a given platform
+func ExecutableExtension(targetOS string) string {
 	switch targetOS {
 	case "darwin":
-		return "FlutterEmbedder.framework"
+		// no special filename
+		return ""
 	case "linux":
-		return "libflutter_engine.so"
+		// no special filename
+		return ""
 	case "windows":
-		return "flutter_engine.dll"
+		return ".exe"
+	default:
+		log.Errorf("Target platform %s is not supported.", targetOS)
+		os.Exit(1)
+		return ""
+	}
+}
+
+// EngineFiles returns the names of the engine files from flutter for the
+// specified platform and build mode.
+func EngineFiles(targetOS string, mode Mode) []string {
+	switch targetOS {
+	case "darwin":
+		return []string{"FlutterMacOS.framework"}
+	case "linux":
+		return []string{"libflutter_linux_gtk.so"}
+	case "windows":
+		if mode.IsAot {
+			return []string{"flutter_windows.dll", "flutter_windows.dll.exp", "flutter_windows.dll.lib", "flutter_windows.dll.pdb"}
+		} else {
+			return []string{"flutter_windows.dll"}
+		}
 	default:
 		log.Errorf("%s has no implemented engine file", targetOS)
+		os.Exit(1)
+		return []string{}
+	}
+}
+
+func LibraryName(targetOS string) string {
+	switch targetOS {
+	case "darwin":
+		return "FlutterMacOS"
+	case "linux":
+		return "flutter_linux_gtk"
+	case "windows":
+		return "flutter_windows"
+	default:
+		log.Errorf("%s has no implemented library file", targetOS)
 		os.Exit(1)
 		return ""
 	}

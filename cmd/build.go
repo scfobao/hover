@@ -34,6 +34,10 @@ var (
 	buildOrRunOpenGlVersion   string
 	buildOrRunEngineVersion   string
 	buildOrRunDocker          bool
+	buildOrRunDebug           bool
+	buildOrRunRelease         bool
+	buildOrRunProfile         bool
+	buildOrRunMode            build.Mode
 )
 
 func initCompileFlags(cmd *cobra.Command) {
@@ -43,13 +47,15 @@ func initCompileFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().StringVar(&buildOrRunOpenGlVersion, "opengl", config.BuildOpenGlVersionDefault, "The OpenGL version specified here is only relevant for external texture plugin (i.e. video_plugin).\nIf 'none' is provided, texture won't be supported. Note: the Flutter Engine still needs a OpenGL compatible context.")
 	cmd.PersistentFlags().StringVar(&buildOrRunEngineVersion, "engine-version", config.BuildEngineDefault, "The flutter engine version to use.")
 	cmd.PersistentFlags().BoolVar(&buildOrRunDocker, "docker", false, "Execute the go build and packaging in a docker container. The Flutter build is always run locally")
+	cmd.PersistentFlags().BoolVar(&buildOrRunDebug, "debug", false, "Build a debug version of the app.")
+	cmd.PersistentFlags().BoolVar(&buildOrRunRelease, "release", false, "Enable release builds. Currently very experimental and only for linux available")
+	cmd.PersistentFlags().BoolVar(&buildOrRunProfile, "profile", false, "Enable profile builds. Currently very experimental and only for linux available")
 
 	cmd.PersistentFlags().MarkHidden("branch")
 }
 
 var (
 	// `hover build`-only build flags
-	buildDebug                  bool
 	buildVersionNumber          string
 	buildSkipEngineDownload     bool
 	buildSkipFlutterBuildBundle bool
@@ -64,9 +70,9 @@ func init() {
 	initCompileFlags(buildCmd)
 
 	buildCmd.PersistentFlags().StringVar(&buildVersionNumber, "version-number", "", "Override the version number used in build and packaging. You may use it with $(git describe --tags)")
-	buildCmd.PersistentFlags().BoolVar(&buildDebug, "debug", false, "Build a debug version of the app.")
 	buildCmd.PersistentFlags().BoolVar(&buildSkipEngineDownload, "skip-engine-download", false, "Skip donwloading the Flutter Engine and artifacts.")
 	buildCmd.PersistentFlags().BoolVar(&buildSkipFlutterBuildBundle, "skip-flutter-build-bundle", false, "Skip the 'flutter build bundle' step.")
+
 	buildCmd.AddCommand(buildLinuxCmd)
 	buildCmd.AddCommand(buildLinuxSnapCmd)
 	buildCmd.AddCommand(buildLinuxDebCmd)
@@ -191,6 +197,8 @@ func subcommandBuild(targetOS string, packagingTask packaging.Task) {
 		packagingTask.AssertSupported()
 	}
 
+	initBuildParameters(targetOS, build.ReleaseMode)
+
 	if !buildSkipFlutterBuildBundle {
 		cleanBuildOutputsDir(targetOS)
 		buildFlutterBundle(targetOS)
@@ -203,8 +211,14 @@ func subcommandBuild(targetOS string, packagingTask packaging.Task) {
 		if buildVersionNumber != "" {
 			buildFlags = append(buildFlags, "--version-number", buildVersionNumber)
 		}
-		if buildDebug {
+		if buildOrRunDebug {
 			buildFlags = append(buildFlags, "--debug")
+		}
+		if buildOrRunRelease {
+			buildFlags = append(buildFlags, "--release")
+		}
+		if buildOrRunProfile {
+			buildFlags = append(buildFlags, "--profile")
 		}
 		dockerHoverBuild(targetOS, packagingTask, buildFlags, nil)
 	} else {
@@ -216,7 +230,7 @@ func subcommandBuild(targetOS string, packagingTask packaging.Task) {
 // initBuildParameters is used to initialize all the build parameters. It sets
 // fallback values based on config or defaults for values that have not
 // explicitly been set through flags.
-func initBuildParameters(targetOS string) {
+func initBuildParameters(targetOS string, defaultbuildOrRunMode build.Mode) {
 	if buildOrRunCachePath == "" {
 		log.Errorf("Missing cache path, cannot continue. Please see previous warning.")
 		os.Exit(1)
@@ -241,14 +255,43 @@ func initBuildParameters(targetOS string) {
 		buildVersionNumber = pubspec.GetPubSpec().GetVersion()
 	}
 
-	engineCachePath = enginecache.EngineCachePath(targetOS, buildOrRunCachePath)
+	numberOfbuildOrRunModeFlagsSet := 0
+	for _, flag := range []bool{buildOrRunDebug, buildOrRunRelease, buildOrRunProfile} {
+		if flag {
+			numberOfbuildOrRunModeFlagsSet++
+		}
+	}
+	if numberOfbuildOrRunModeFlagsSet > 1 {
+		log.Errorf("Only one of --debug, --release or --profile can be set at one time")
+		os.Exit(1)
+	}
+	if numberOfbuildOrRunModeFlagsSet == 0 {
+		buildOrRunMode = defaultbuildOrRunMode
+	}
+
+	if buildOrRunDebug {
+		buildOrRunMode = build.DebugMode
+	}
+	if buildOrRunRelease {
+		buildOrRunMode = build.ReleaseMode
+	}
+	if buildOrRunProfile {
+		buildOrRunMode = build.ProfileMode
+	}
+
+	if buildOrRunMode.IsAot && targetOS != runtime.GOOS {
+		log.Errorf("AOT builds currently only work on their host OS")
+		os.Exit(1)
+	}
+
+	engineCachePath = enginecache.EngineCachePath(targetOS, buildOrRunCachePath, buildOrRunMode)
 	if !buildSkipEngineDownload {
-		enginecache.ValidateOrUpdateEngine(targetOS, buildOrRunCachePath, buildOrRunEngineVersion)
+		enginecache.ValidateOrUpdateEngine(targetOS, buildOrRunCachePath, buildOrRunEngineVersion, buildOrRunMode)
 	}
 }
 
 func commonFlags() []string {
-	f := []string{}
+	var f []string
 	if buildOrRunFlutterTarget != config.BuildTargetDefault {
 		f = append(f, "--target", buildOrRunFlutterTarget)
 	}
@@ -319,24 +362,105 @@ func buildFlutterBundle(targetOS string) {
 	}
 
 	checkFlutterChannel()
+	var trackWidgetCreation string
+	if buildOrRunMode == build.DebugMode {
+		trackWidgetCreation = "--track-widget-creation"
+	}
 
-	var flutterBuildBundleArgs = []string{
-		"build", "bundle",
+	cmdFlutterBuild := exec.Command(build.FlutterBin(), "build", "bundle",
 		"--asset-dir", filepath.Join(build.OutputDirectoryPath(targetOS), "flutter_assets"),
 		"--target", buildOrRunFlutterTarget,
-	}
-	if buildDebug {
-		flutterBuildBundleArgs = append(flutterBuildBundleArgs, "--track-widget-creation")
-	}
-	cmdFlutterBuildBundle := exec.Command(build.FlutterBin(), flutterBuildBundleArgs...)
-	cmdFlutterBuildBundle.Stderr = os.Stderr
-	cmdFlutterBuildBundle.Stdout = os.Stdout
+		trackWidgetCreation,
+	)
+	cmdFlutterBuild.Stderr = os.Stderr
+	cmdFlutterBuild.Stdout = os.Stdout
 
-	log.Infof("Building flutter bundle")
-	err = cmdFlutterBuildBundle.Run()
+	log.Infof("Bundling flutter app")
+	err = cmdFlutterBuild.Run()
 	if err != nil {
 		log.Errorf("Flutter build failed: %v", err)
 		os.Exit(1)
+	}
+	if buildOrRunMode.IsAot {
+		err := os.Remove(filepath.Join(build.OutputDirectoryPath(targetOS), "flutter_assets", "isolate_snapshot_data"))
+		if err != nil {
+			log.Errorf("Failed to remove unused isolate_snapshot_data: %v", err)
+			os.Exit(1)
+		}
+		err = os.Remove(filepath.Join(build.OutputDirectoryPath(targetOS), "flutter_assets", "vm_snapshot_data"))
+		if err != nil {
+			log.Errorf("Failed to remove unused vm_snapshot_data: %v", err)
+			os.Exit(1)
+		}
+		err = os.Remove(filepath.Join(build.OutputDirectoryPath(targetOS), "flutter_assets", "kernel_blob.bin"))
+		if err != nil {
+			log.Errorf("Failed to remove unused kernel_blob.bin: %v", err)
+			os.Exit(1)
+		}
+		dart := filepath.Join(engineCachePath, "dart-sdk", "bin", "dart"+build.ExecutableExtension(targetOS))
+		var genSnapshot string
+		if targetOS == "darwin" {
+			genSnapshot = filepath.Join(engineCachePath, "artifacts", "gen_snapshot"+build.ExecutableExtension(targetOS))
+		} else {
+			genSnapshot = filepath.Join(engineCachePath, "gen_snapshot"+build.ExecutableExtension(targetOS))
+		}
+		kernelSnapshot := filepath.Join(build.OutputDirectoryPath(targetOS), "kernel_snapshot.dill")
+		elfSnapshot := filepath.Join(build.OutputDirectoryPath(targetOS), "libapp.so")
+		cmdGenerateKernelSnapshot := exec.Command(
+			dart,
+			filepath.Join(engineCachePath, "artifacts", "frontend_server.dart.snapshot"),
+			"--sdk-root="+filepath.Join(engineCachePath, "flutter_patched_sdk_product"),
+			"--target=flutter",
+			"--aot",
+			"--tfa",
+			"-Ddart.vm.product=true",
+			"--packages=.packages",
+			"--output-dill="+kernelSnapshot,
+			buildOrRunFlutterTarget,
+		)
+		cmdGenerateKernelSnapshot.Stderr = os.Stderr
+		log.Infof("Generating kernel snapshot")
+		output, err := cmdGenerateKernelSnapshot.Output()
+		if err != nil {
+			log.Errorf("Generating kernel snapshot failed: %v", err)
+			log.Errorf(string(output))
+			os.Exit(1)
+		}
+		generateAotSnapshotCommand := []string{
+			genSnapshot,
+			"--no-causal-async-stacks",
+			"--lazy-async-stacks",
+			"--deterministic",
+			"--snapshot_kind=app-aot-elf",
+			"--elf=" + elfSnapshot,
+		}
+		if buildOrRunMode == build.ReleaseMode {
+			generateAotSnapshotCommand = append(generateAotSnapshotCommand, "--strip")
+		}
+		if targetOS == "darwin" {
+			generateAotSnapshotCommand = append(generateAotSnapshotCommand,
+				"--dedup-instructions",
+				"--no-code-comments",
+			)
+		}
+		generateAotSnapshotCommand = append(generateAotSnapshotCommand, kernelSnapshot)
+		cmdGenerateAotSnapshot := exec.Command(
+			generateAotSnapshotCommand[0],
+			generateAotSnapshotCommand[1:]...,
+		)
+		cmdGenerateAotSnapshot.Stderr = os.Stderr
+		log.Infof("Generating ELF snapshot")
+		output, err = cmdGenerateAotSnapshot.Output()
+		if err != nil {
+			log.Errorf("Generating AOT snapshot failed: %v", err)
+			log.Errorf(string(output))
+			os.Exit(1)
+		}
+		err = os.Remove(kernelSnapshot)
+		if err != nil {
+			log.Errorf("Failed to remove kernel_snapshot.dill: %v", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -344,28 +468,29 @@ func buildGoBinary(targetOS string, vmArguments []string) {
 	if vmArgsFromEnv := os.Getenv("HOVER_IN_DOCKER_BUILD_VMARGS"); len(vmArgsFromEnv) > 0 {
 		vmArguments = append(vmArguments, strings.Split(vmArgsFromEnv, ",")...)
 	}
-	initBuildParameters(targetOS)
 
 	fileutils.CopyDir(build.IntermediatesDirectoryPath(targetOS), build.OutputDirectoryPath(targetOS))
 
-	outputEngineFile := filepath.Join(build.OutputDirectoryPath(targetOS), build.EngineFilename(targetOS))
-	if _, err := os.Stat(outputEngineFile); err == nil || os.IsExist(err) {
-		err = os.RemoveAll(outputEngineFile)
+	for _, engineFile := range build.EngineFiles(targetOS, buildOrRunMode) {
+		outputEngineFile := filepath.Join(build.OutputDirectoryPath(targetOS), engineFile)
+		if _, err := os.Stat(outputEngineFile); err == nil || os.IsExist(err) {
+			err = os.RemoveAll(outputEngineFile)
+			if err != nil {
+				log.Errorf("Failed to remove old engine: %v", err)
+				os.Exit(1)
+			}
+		}
+		err := copy.Copy(
+			filepath.Join(engineCachePath, engineFile),
+			outputEngineFile,
+		)
 		if err != nil {
-			log.Errorf("Failed to remove old engine: %v", err)
+			log.Errorf("Failed to copy %s: %v", engineFile, err)
 			os.Exit(1)
 		}
 	}
-	err := copy.Copy(
-		filepath.Join(engineCachePath, build.EngineFilename(targetOS)),
-		outputEngineFile,
-	)
-	if err != nil {
-		log.Errorf("Failed to copy %s: %v", build.EngineFilename(targetOS), err)
-		os.Exit(1)
-	}
 
-	err = copy.Copy(
+	err := copy.Copy(
 		filepath.Join(engineCachePath, "artifacts", "icudtl.dat"),
 		filepath.Join(build.OutputDirectoryPath(targetOS), "icudtl.dat"),
 	)
@@ -433,14 +558,6 @@ func buildGoBinary(targetOS string, vmArguments []string) {
 		log.Warnf("The '--opengl=none' flag makes go-flutter incompatible with texture plugins!")
 	}
 
-	if !buildDebug && targetOS == "linux" {
-		err = exec.Command("strip", "-s", outputEngineFile).Run()
-		if err != nil {
-			log.Errorf("Failed to strip %s: %v", outputEngineFile, err)
-			os.Exit(1)
-		}
-	}
-
 	buildCommandString := buildCommand(targetOS, vmArguments, build.OutputBinaryPath(config.GetConfig().GetExecutableName(pubspec.GetPubSpec().Name), targetOS))
 	cmdGoBuild := exec.Command(buildCommandString[0], buildCommandString[1:]...)
 	cmdGoBuild.Dir = filepath.Join(wd, build.BuildPath)
@@ -471,11 +588,14 @@ func buildEnv(targetOS string, engineCachePath string) []string {
 		cgoLdflags = fmt.Sprintf("-F%s -Wl,-rpath,@executable_path", engineCachePath)
 		cgoLdflags += fmt.Sprintf(" -F%s -L%s", outputDirPath, outputDirPath)
 		cgoLdflags += " -mmacosx-version-min=10.10"
+		cgoLdflags += fmt.Sprintf(" -framework %s", build.LibraryName(targetOS))
 		cgoCflags = "-mmacosx-version-min=10.10"
 	case "linux":
 		cgoLdflags = fmt.Sprintf("-L%s -L%s", engineCachePath, outputDirPath)
+		cgoLdflags += fmt.Sprintf(" -l%s -Wl,-rpath,$ORIGIN", build.LibraryName(targetOS))
 	case "windows":
 		cgoLdflags = fmt.Sprintf("-L%s -L%s", engineCachePath, outputDirPath)
+		cgoLdflags += fmt.Sprintf(" -l%s", build.LibraryName(targetOS))
 	default:
 		log.Errorf("Target platform %s is not supported, cgo_ldflags not implemented.", targetOS)
 		os.Exit(1)
@@ -517,7 +637,7 @@ func buildCommand(targetOS string, vmArguments []string, outputBinaryPath string
 	}
 
 	var ldflags []string
-	if !buildDebug {
+	if buildOrRunMode != build.DebugMode {
 		vmArguments = append(vmArguments, "--disable-dart-asserts")
 		vmArguments = append(vmArguments, "--disable-observatory")
 
